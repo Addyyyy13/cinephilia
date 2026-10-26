@@ -1,0 +1,29 @@
+# Build artifacts
+*.o
+cinephilia
+cinephile
+
+# Data (user's personal archive)
+data/films.dat
+data/films.txt
+data/*.bak
+data/*.tmp
+
+# IDE and OS
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Environment
+.env
+
+# Accidental directories
+brew/
+curl/
+install/
+s/
+src/cp/
+src/test/
