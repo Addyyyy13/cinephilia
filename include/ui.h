@@ -1,59 +1,135 @@
-#ifndef UI_H
-#define UI_H
+/*
+ * ui.h — Cinephilia's visual system: palette, typography helpers, menus,
+ * pages, prompts, transitions and the opening sequence.
+ *
+ * Two modes, chosen automatically:
+ *   interactive — stdin and stdout are a real terminal (TERM not "dumb"):
+ *                 alternate screen, arrow-key menus, colour, motion. The
+ *                 terminal is always restored on exit, Ctrl+C, SIGTERM,
+ *                 SIGHUP, and around Ctrl+Z.
+ *   line mode   — pipes, files, dumb terminals: numbered menus and plain
+ *                 prompts with no escape sequences. The end-to-end tests
+ *                 drive the application this way.
+ * Independently, when the locale is not UTF-8 (or CINEPHILIA_ASCII is set)
+ * every decorative glyph is replaced by a one-column ASCII equivalent on
+ * output, so alignment never changes.
+ */
+#ifndef CINEPHILIA_UI_H
+#define CINEPHILIA_UI_H
 
-#include "film.h"
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <termios.h>
+#include <stdbool.h>
+#include <stddef.h>
 
-/* --- ANSI Color Palette --- */
-#define RESET       "\033[0m"
-#define BOLD        "\033[1m"
-#define DIM         "\033[2m"
-#define IVORY       "\033[38;2;234;228;216m"    /* #EAE4D8 */
-#define CORAL       "\033[38;2;199;109;97m"     /* #C76D61 */
-#define GOLD        "\033[38;2;184;154;99m"     /* #B89A63 */
-#define MUTED       "\033[38;2;119;115;109m"    /* #77736D */
-#define BG_DARK     "\033[48;2;10;10;10m"       /* #0A0A0A */
+#include "sb.h"
 
-/* --- Terminal Utilities --- */
-void ui_get_terminal_size(int *cols, int *rows);
-void ui_clear_screen(void);
-void ui_move_cursor(int row, int col);
-void ui_hide_cursor(void);
-void ui_show_cursor(void);
-void ui_flush(void);
-int  ui_is_interactive(void);
+/* Foreground roles. Backgrounds (midnight #0A0A0A, charcoal #151515,
+ * graphite #1D1B19) are applied by the layout code itself. */
+typedef enum {
+    UI_IVORY, /* primary text          #EAE4D8 */
+    UI_STONE, /* secondary text        #969087 */
+    UI_GREY,  /* hints, tertiary text  #77736D */
+    UI_RED,   /* actions, selection    #C76D61 */
+    UI_GOLD,  /* small highlights      #B89A63 */
+    UI_ASH,   /* separators, shadows   #35312D */
+    UI_BRASS, /* film-strip frames     #5E5037 */
+    UI_COLOR_COUNT
+} UiColor;
 
-/* --- Safe Input --- */
-void ui_read_line(const char *prompt, char *buf, int maxlen);
-int  ui_read_int(const char *prompt, int *out);
-int  ui_read_float(const char *prompt, float *out);
-int  ui_confirm(const char *prompt); /* returns 1 for yes, 0 for no */
-void ui_press_enter(void); /* "Press Enter to continue..." */
+typedef enum { UI_TONE_INFO, UI_TONE_OK, UI_TONE_WARN, UI_TONE_ERROR } UiTone;
 
-/* --- Display Components --- */
-void ui_print_header(const char *title);
-void ui_print_divider(void);
-void ui_print_film_card(const Film *film, int show_details);
-void ui_print_film_list(Archive *ar, int watched_filter); /* -1=all, 0=watchlist, 1=watched */
-void ui_print_empty_archive(void);
+typedef enum {
+    PROMPT_OK,     /* a value was entered */
+    PROMPT_BLANK,  /* Enter on an empty line */
+    PROMPT_CLEAR,  /* "-" (number and date prompts only) */
+    PROMPT_CANCEL  /* end of input (Ctrl+D, or the input stream ended) */
+} PromptResult;
 
-/* --- Opening Sequence --- */
-void ui_opening_animation(void);
-void ui_print_title_art(void);
+/* Moments the interface reports so the application can attach sound. */
+typedef enum { UI_EVENT_MOVE, UI_EVENT_ERROR } UiEvent;
 
-/* --- Main Menu --- */
-int  ui_main_menu(void);
+enum { UI_BACK = -1 };
 
-/* --- Film Forms --- */
-void ui_add_film_form(Archive *ar);
-void ui_edit_film_form(Archive *ar);
-void ui_delete_film(Archive *ar);
-void ui_view_film_detail(Archive *ar);
+typedef struct {
+    bool no_animation;
+    bool no_color;
+} UiOptions;
 
-/* --- Terminal State --- */
-void ui_setup_terminal(void);
-void ui_restore_terminal(void);
+void ui_init(const UiOptions *opts);
+void ui_shutdown(void); /* idempotent */
+bool ui_interactive(void);
+bool ui_input_closed(void);
+bool ui_ascii(void);
+void ui_set_animation(bool on);
+bool ui_animation(void);
+void ui_set_event_hook(void (*hook)(UiEvent));
+/* Called from fatal-signal handlers; must be async-signal-safe. */
+void ui_set_signal_cleanup(void (*fn)(void));
 
-#endif /* UI_H */
+int ui_cols(void);
+int ui_rows(void);
+int ui_content_width(void);
+int ui_margin(void);
+
+/* Styling into a builder; these emit nothing when colour is off. */
+void ui_sb_fg(Sb *sb, UiColor c);
+void ui_sb_bold(Sb *sb);
+void ui_sb_italic(Sb *sb);
+void ui_sb_plain(Sb *sb); /* regular weight, ivory, midnight background */
+void ui_sb_margin(Sb *sb);
+/* Letter-spaced upper-case label: "Statistics" -> "S T A T I S T I C S". */
+void ui_sb_tracked(Sb *sb, const char *text);
+/* Three rows of large numerals (digits, '.', '/', ' '), appended to rows[0..2]. */
+int ui_sb_bignum(Sb rows[3], const char *text);
+
+/*
+ * Menus. Each item is
+ *     "label[\tdetail][\nsecond line[\nthird line ...]]"
+ * A label beginning with digits and two spaces ("01  THE COLLECTION")
+ * gets a styled index number. Lines after the first are secondary text; a
+ * line beginning with '\x0e' is set in italics (personal notes). An empty
+ * item is a spacer and an item beginning with '\f' is a heading; neither
+ * can be selected. The preamble and postamble are pre-styled lines that
+ * scroll with the items.
+ */
+typedef struct {
+    const char *section;         /* designation in the header (upper-cased) */
+    const StrList *preamble;
+    const char *const *items;
+    int count;
+    int selected;
+    const char *back_label;      /* "Back", "Exit", ... */
+    const StrList *postamble;
+    const char *highlight;       /* text to mark inside items (search) */
+    bool detail_right;           /* right-align details (catalogue rows) */
+    bool number_keys;            /* keys 1-9 choose the n-th option */
+} UiMenu;
+
+/* Returns the chosen index or UI_BACK. */
+int ui_menu(const UiMenu *m);
+void ui_page(const char *section, const StrList *lines);
+
+void ui_form_begin(const char *section, const char *heading, const char *instructions);
+PromptResult ui_prompt(const char *label, const char *hint, const char *current,
+                       char *out, size_t cap);
+PromptResult ui_prompt_int(const char *label, const char *hint, const char *current,
+                           int min, int max, int *out);
+/* YYYY-MM-DD or "today"; dates after max_date (if given) are refused. */
+PromptResult ui_prompt_date(const char *label, const char *hint, const char *current,
+                            const char *max_date, char out[11]);
+bool ui_confirm(const char *question, bool default_yes);
+
+void ui_say(UiTone tone, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+/* Shown on the next screen (printed at once in line mode). */
+void ui_flash(UiTone tone, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+/* The opening sequence and title card. Returns false if the user asked to
+ * leave. `on_start` is called as the sequence begins (to start a sound). */
+bool ui_intro(const char *count_line, void (*on_start)(void));
+/* The reel-like reveal used by Tonight's Selection. */
+void ui_reveal(const char *section, const char *heading, const char *const *names, size_t n,
+               const char *final_title);
+/* A closing card; waits up to `ms` (any key skips). */
+void ui_farewell(int ms);
+void ui_print_banner(void);
+
+#endif

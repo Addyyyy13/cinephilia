@@ -1,369 +1,549 @@
 /*
- * storage.c — Persistence layer for film archive data
- * Part of CINEPHILIA: a personal film archive
- *
- * File format (v2):
- *   First line:  #CINEPHILIA_V2
- *   Each record:  id|title|director|year|rating|genre|notes|watched|date_watched|journal
- *
- * Supports migration from v1 (5-field) format and atomic writes via
- * temporary file + rename.
+ * storage.c — versioned plain-text persistence with atomic saves.
+ * See storage.h for the format.
  */
-
 #include "storage.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
-/* ── paths ─────────────────────────────────────────────────────────── */
+#include "text.h"
 
-#define DATA_DIR        "data"
-#define V2_PATH         DATA_DIR "/films.dat"
-#define V2_TMP_PATH     DATA_DIR "/films.dat.tmp"
-#define V1_PATH         DATA_DIR "/films.txt"
-#define V1_BAK_PATH     DATA_DIR "/films.txt.bak"
-#define V2_HEADER       "#CINEPHILIA_V2"
+#define MAGIC "CINEPHILIA"
+#define FILM_FIELDS 11
+#define ENTRY_FIELDS 5
+#define MAX_FIELDS 16
 
-/* ── helpers ───────────────────────────────────────────────────────── */
+/* ------------------------------------------------------------------ */
+/* Reading                                                            */
+/* ------------------------------------------------------------------ */
 
-/*
- * sanitize_string — strip control characters (< 0x20) from a string,
- * preserving tabs.  Modifies the buffer in place.
- */
-static void sanitize_string(char *s) {
-    char *r = s, *w = s;
-    while (*r) {
-        if ((unsigned char)*r >= 0x20 || *r == '\t') {
+static void unescape(char *s)
+{
+    char *w = s;
+    for (char *r = s; *r; r++) {
+        if (*r == '\\' && r[1] != '\0') {
+            r++;
+            switch (*r) {
+            case 't': *w++ = '\t'; break;
+            case 'n': *w++ = '\n'; break;
+            case 'r': *w++ = '\r'; break;
+            default: *w++ = *r; break; /* "\\" and unknown escapes */
+            }
+        } else {
             *w++ = *r;
         }
-        r++;
     }
     *w = '\0';
 }
 
-/*
- * parse_field — extract the next pipe-delimited field from `line`
- * starting at byte offset *pos.  Copies up to maxlen-1 characters into
- * `buf` and null-terminates.  Advances *pos past the delimiter.
- *
- * Returns 1 if a field was consumed (even if empty), 0 at end-of-line.
- */
-static int parse_field(const char *line, int *pos, char *buf, int maxlen) {
-    int start = *pos;
-    int i = 0;
-
-    while (line[*pos] && line[*pos] != '|' && line[*pos] != '\n') {
-        if (i < maxlen - 1) {
-            buf[i++] = line[*pos];
+/* Splits on TAB in place. Returns the field count, or -1 if there are more
+ * than max fields. */
+static int split_tabs(char *line, char **fields, int max)
+{
+    int n = 0;
+    fields[n++] = line;
+    for (char *p = line; *p; p++) {
+        if (*p == '\t') {
+            if (n == max)
+                return -1;
+            *p = '\0';
+            fields[n++] = p + 1;
         }
-        (*pos)++;
     }
-    buf[i] = '\0';
-
-    /* advance past the pipe delimiter if present */
-    if (line[*pos] == '|') {
-        (*pos)++;
-    }
-
-    /* a field was consumed if we moved at all or hit a pipe */
-    return (*pos > start) ? 1 : 0;
+    return n;
 }
 
-/* ── directory management ──────────────────────────────────────────── */
+/* Cleans a field for storage in a fixed buffer: unescape, strip control
+ * characters (so no stored text can emit terminal escapes), trim. */
+static void take_field(char *dst, size_t cap, char *src)
+{
+    unescape(src);
+    text_sanitize(src);
+    text_trim(src);
+    text_copy(dst, cap, src);
+}
 
-/*
- * storage_ensure_dir — create the data/ directory if it does not
- * already exist.  Returns 0 on success, -1 on error.
- */
-int storage_ensure_dir(void) {
+static bool parse_uint(const char *s, unsigned long max, unsigned long *out)
+{
+    if (*s == '\0')
+        return false;
+    unsigned long v = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p < '0' || *p > '9')
+            return false;
+        unsigned d = (unsigned)(*p - '0');
+        if (v > (max - d) / 10)
+            return false;
+        v = v * 10 + d;
+    }
+    *out = v;
+    return true;
+}
+
+static bool parse_date_field(char *field, char out[DATE_LEN])
+{
+    text_trim(field);
+    if (field[0] == '\0') {
+        out[0] = '\0';
+        return true;
+    }
+    if (!date_valid(field))
+        return false;
+    text_copy(out, DATE_LEN, field);
+    return true;
+}
+
+/* Parses an F record. Returns NULL (and frees nothing) if invalid. */
+static Film *parse_film(char **fld, const Archive *a)
+{
+    unsigned long id, year, rating;
+    if (!parse_uint(fld[1], UINT_MAX, &id) || id == 0 || archive_find(a, (unsigned)id))
+        return NULL;
+    if (strcmp(fld[2], "w") != 0 && strcmp(fld[2], "l") != 0)
+        return NULL;
+    if (!parse_uint(fld[3], FILM_YEAR_MAX, &year) || (year != 0 && year < FILM_YEAR_MIN))
+        return NULL;
+    if (!parse_uint(fld[4], RATING_MAX, &rating))
+        return NULL;
+
+    Film *f = film_new();
+    if (!f)
+        return NULL;
+    f->id = (unsigned)id;
+    f->status = fld[2][0] == 'w' ? FILM_WATCHED : FILM_WATCHLIST;
+    f->year = (int)year;
+    f->rating = (int)rating;
+    if (!parse_date_field(fld[5], f->added_on) || !parse_date_field(fld[6], f->watched_on)) {
+        free(f);
+        return NULL;
+    }
+    take_field(f->title, sizeof f->title, fld[7]);
+    take_field(f->director, sizeof f->director, fld[8]);
+    take_field(f->genre, sizeof f->genre, fld[9]);
+    take_field(f->notes, sizeof f->notes, fld[10]);
+
+    char err[64];
+    if (!film_validate(f, err, sizeof err)) {
+        free(f);
+        return NULL;
+    }
+    return f;
+}
+
+typedef struct {
+    unsigned id;
+    unsigned film_id;
+    char date[DATE_LEN];
+    char *text;
+} PendingEntry;
+
+static void note_bad_line(StorageReport *r, long lineno)
+{
+    r->skipped_lines++;
+    if (r->first_bad_line == 0)
+        r->first_bad_line = lineno;
+}
+
+StorageStatus storage_load(const char *path, Archive *out, StorageReport *report)
+{
+    memset(report, 0, sizeof *report);
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        if (errno == ENOENT) {
+            snprintf(report->message, sizeof report->message,
+                     "No archive yet at %s; a new one will be created.", path);
+            return STORAGE_NEW;
+        }
+        snprintf(report->message, sizeof report->message, "Cannot open %s: %s",
+                 path, strerror(errno));
+        return STORAGE_IO_ERROR;
+    }
+
+    Archive tmp;
+    archive_init(&tmp);
+    PendingEntry *pending = NULL;
+    size_t pending_n = 0;
+    size_t pending_cap = 0;
+    StorageStatus status = STORAGE_OK;
+    bool header = false;
+    bool any_content = false;
+    long lineno = 0;
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t len;
+
+    while ((len = getline(&line, &linecap, fp)) != -1) {
+        lineno++;
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (line[0] == '\0' || line[0] == '#')
+            continue;
+
+        if (!header) {
+            any_content = true;
+            unsigned long version;
+            size_t mlen = strlen(MAGIC);
+            if (strncmp(line, MAGIC, mlen) == 0 && line[mlen] == ' ' &&
+                parse_uint(line + mlen + 1, 1000000, &version)) {
+                if (version == STORAGE_FORMAT_VERSION) {
+                    header = true;
+                    continue;
+                }
+                snprintf(report->message, sizeof report->message,
+                         "%s uses archive format %lu, which is newer than this version "
+                         "of Cinephilia understands (format %d). It was opened read-only.",
+                         path, version, STORAGE_FORMAT_VERSION);
+            } else {
+                snprintf(report->message, sizeof report->message,
+                         "%s does not look like a Cinephilia archive (line %ld). "
+                         "It was opened read-only and will not be overwritten.",
+                         path, lineno);
+            }
+            status = STORAGE_UNSUPPORTED;
+            break;
+        }
+
+        char *fld[MAX_FIELDS];
+        int n = split_tabs(line, fld, MAX_FIELDS);
+        if (n == FILM_FIELDS && strcmp(fld[0], "F") == 0) {
+            Film *f = parse_film(fld, &tmp);
+            if (f && archive_append(&tmp, f))
+                report->films++;
+            else {
+                free(f);
+                note_bad_line(report, lineno);
+            }
+        } else if (n == ENTRY_FIELDS && strcmp(fld[0], "J") == 0) {
+            unsigned long id, film_id;
+            char date[DATE_LEN];
+            if (!parse_uint(fld[1], UINT_MAX, &id) || id == 0 ||
+                !parse_uint(fld[2], UINT_MAX, &film_id) || film_id == 0 ||
+                !parse_date_field(fld[3], date) || date[0] == '\0') {
+                note_bad_line(report, lineno);
+                continue;
+            }
+            if (pending_n == pending_cap) {
+                size_t cap = pending_cap ? pending_cap * 2 : 32;
+                PendingEntry *grown = realloc(pending, cap * sizeof *grown);
+                if (!grown) {
+                    note_bad_line(report, lineno);
+                    continue;
+                }
+                pending = grown;
+                pending_cap = cap;
+            }
+            char text[FILM_NOTES_MAX];
+            take_field(text, sizeof text, fld[4]);
+            char *copy = malloc(strlen(text) + 1);
+            if (!copy) {
+                note_bad_line(report, lineno);
+                continue;
+            }
+            strcpy(copy, text);
+            PendingEntry *pe = &pending[pending_n++];
+            pe->id = (unsigned)id;
+            pe->film_id = (unsigned)film_id;
+            text_copy(pe->date, sizeof pe->date, date);
+            pe->text = copy;
+        } else {
+            note_bad_line(report, lineno);
+        }
+    }
+
+    bool read_error = ferror(fp) != 0;
+    free(line);
+    fclose(fp);
+
+    /* Journal lines are resolved after all films are known, so their order
+     * in the file does not matter. */
+    if (status == STORAGE_OK && !read_error) {
+        for (size_t i = 0; i < pending_n; i++) {
+            PendingEntry *pe = &pending[i];
+            if (!archive_find(&tmp, pe->film_id)) {
+                report->orphan_entries++;
+                report->skipped_lines++;
+            } else if (archive_entry_find(&tmp, pe->id) ||
+                       archive_add_entry(&tmp, pe->id, pe->film_id, pe->date, pe->text) == 0) {
+                report->skipped_lines++;
+            } else {
+                report->entries++;
+            }
+        }
+    }
+    for (size_t i = 0; i < pending_n; i++)
+        free(pending[i].text);
+    free(pending);
+
+    if (read_error) {
+        snprintf(report->message, sizeof report->message, "Error while reading %s.", path);
+        archive_free(&tmp);
+        return STORAGE_IO_ERROR;
+    }
+    if (status == STORAGE_UNSUPPORTED) {
+        archive_free(&tmp);
+        return status;
+    }
+    if (!header) {
+        archive_free(&tmp);
+        if (any_content) /* unreachable: content without header is unsupported */
+            return STORAGE_UNSUPPORTED;
+        snprintf(report->message, sizeof report->message,
+                 "%s is empty; starting a new archive.", path);
+        return STORAGE_NEW;
+    }
+
+    if (report->skipped_lines > 0) {
+        status = STORAGE_RECOVERED;
+        snprintf(report->message, sizeof report->message,
+                 "Skipped %zu unreadable line%s in %s (first at line %ld).",
+                 report->skipped_lines, report->skipped_lines == 1 ? "" : "s", path,
+                 report->first_bad_line ? report->first_bad_line : 0L);
+    } else {
+        snprintf(report->message, sizeof report->message, "Loaded %zu films.", report->films);
+    }
+    archive_free(out);
+    *out = tmp;
+    return status;
+}
+
+/* ------------------------------------------------------------------ */
+/* Writing                                                            */
+/* ------------------------------------------------------------------ */
+
+static bool write_field(FILE *fp, const char *s)
+{
+    for (; *s; s++) {
+        int rc;
+        switch (*s) {
+        case '\\': rc = fputs("\\\\", fp); break;
+        case '\t': rc = fputs("\\t", fp); break;
+        case '\n': rc = fputs("\\n", fp); break;
+        case '\r': rc = fputs("\\r", fp); break;
+        default: rc = fputc((unsigned char)*s, fp); break;
+        }
+        if (rc == EOF)
+            return false;
+    }
+    return true;
+}
+
+/* Flushes file contents to stable storage. On macOS plain fsync() only
+ * reaches the drive's cache; F_FULLFSYNC asks the drive to flush too. */
+static int full_sync(int fd)
+{
+#ifdef F_FULLFSYNC
+    if (fcntl(fd, F_FULLFSYNC) == 0)
+        return 0;
+#endif
+    return fsync(fd);
+}
+
+static bool ensure_parent_dir(const char *path, char *err, size_t errcap)
+{
+    char buf[PATH_MAX];
+    if (text_copy(buf, sizeof buf, path) != strlen(path)) {
+        snprintf(err, errcap, "path is too long");
+        return false;
+    }
+    char *slash = strrchr(buf, '/');
+    if (!slash || slash == buf)
+        return true; /* current directory or root */
+    *slash = '\0';
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(buf, 0700) != 0 && errno != EEXIST) {
+                snprintf(err, errcap, "cannot create folder %s: %s", buf, strerror(errno));
+                return false;
+            }
+            *p = '/';
+        }
+    }
+    if (mkdir(buf, 0700) != 0 && errno != EEXIST) {
+        snprintf(err, errcap, "cannot create folder %s: %s", buf, strerror(errno));
+        return false;
+    }
     struct stat st;
-    if (stat(DATA_DIR, &st) == 0) {
-        /* exists — make sure it's a directory */
-        if (S_ISDIR(st.st_mode)) return 0;
-        return -1;  /* exists but is not a directory */
+    if (stat(buf, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        snprintf(err, errcap, "%s is not a folder", buf);
+        return false;
     }
-
-    if (mkdir(DATA_DIR, 0755) != 0) {
-        return -1;
-    }
-    return 0;
+    return true;
 }
 
-/* ── v1 loader (migration) ─────────────────────────────────────────── */
+static void sync_parent_dir(const char *path)
+{
+    char buf[PATH_MAX];
+    text_copy(buf, sizeof buf, path);
+    char *slash = strrchr(buf, '/');
+    if (slash == buf)
+        slash[1] = '\0';
+    else if (slash)
+        *slash = '\0';
+    else
+        strcpy(buf, ".");
+    int fd = open(buf, O_RDONLY);
+    if (fd >= 0) {
+        (void)fsync(fd); /* best effort; not supported everywhere */
+        close(fd);
+    }
+}
 
-/*
- * load_v1 — read the legacy 5-field format from V1_PATH into the
- * archive, filling missing v2 fields with sensible defaults:
- *   genre        = "Unclassified"
- *   notes        = ""
- *   watched      = 1
- *   date_watched = ""
- *   journal      = ""
- *
- * After loading, backs up films.txt → films.txt.bak and saves the
- * archive in v2 format.
- *
- * Returns: number of records loaded, or -1 on error.
- */
-static int load_v1(Archive *ar) {
-    FILE *fp = fopen(V1_PATH, "r");
-    if (fp == NULL) return -1;
-
-    char line[4096];
-    int loaded = 0;
-    int max_id = 0;
-
-    while (fgets(line, sizeof(line), fp)) {
-        /* skip blank lines */
-        if (line[0] == '\n' || line[0] == '\0') continue;
-
-        Film film;
-        memset(&film, 0, sizeof(film));
-
-        int pos = 0;
-        char id_buf[16];
-
-        /* v1 format: id|title|director|year|rating */
-        if (!parse_field(line, &pos, id_buf, sizeof(id_buf)))       continue;
-        if (!parse_field(line, &pos, film.title, sizeof(film.title))) continue;
-        if (!parse_field(line, &pos, film.director, sizeof(film.director))) continue;
-
-        char year_buf[16];
-        if (!parse_field(line, &pos, year_buf, sizeof(year_buf)))   continue;
-
-        char rating_buf[16];
-        if (!parse_field(line, &pos, rating_buf, sizeof(rating_buf))) continue;
-
-        film.id   = atoi(id_buf);
-        film.year = atoi(year_buf);
-        film.rating = (float)atof(rating_buf);
-
-        /* sanitize text fields */
-        sanitize_string(film.title);
-        sanitize_string(film.director);
-
-        /* fill in v2 defaults */
-        strncpy(film.genre, "Unclassified", sizeof(film.genre) - 1);
-        film.genre[sizeof(film.genre) - 1] = '\0';
-        film.notes[0]        = '\0';
-        film.watched         = 1;
-        film.date_watched[0] = '\0';
-        film.journal[0]      = '\0';
-
-        if (film.id <= 0) continue;  /* skip malformed ids */
-
-        /* track the highest id so we can set next_id correctly */
-        if (film.id > max_id) max_id = film.id;
-
-        /* insert directly: allocate and append to list */
-        Film *new_film = malloc(sizeof(Film));
-        if (new_film == NULL) continue;
-
-        *new_film = film;
-        new_film->next = NULL;
-
-        if (ar->head == NULL) {
-            ar->head = new_film;
-        } else {
-            Film *cur = ar->head;
-            while (cur->next) cur = cur->next;
-            cur->next = new_film;
+bool storage_copy_file(const char *from, const char *to, char *err, size_t errcap)
+{
+    int in = open(from, O_RDONLY);
+    if (in < 0) {
+        snprintf(err, errcap, "cannot read %s: %s", from, strerror(errno));
+        return false;
+    }
+    int outfd = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (outfd < 0) {
+        snprintf(err, errcap, "cannot create %s: %s", to, strerror(errno));
+        close(in);
+        return false;
+    }
+    char buf[8192];
+    bool ok = true;
+    for (;;) {
+        ssize_t n = read(in, buf, sizeof buf);
+        if (n == 0)
+            break;
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            ok = false;
+            break;
         }
-        ar->count++;
-        loaded++;
-    }
-
-    fclose(fp);
-
-    ar->next_id  = max_id + 1;
-    ar->modified = 1;  /* mark dirty so caller saves as v2 */
-
-    /* back up the old v1 file */
-    rename(V1_PATH, V1_BAK_PATH);
-
-    /* immediately persist in v2 format */
-    storage_save(ar);
-
-    return loaded;
-}
-
-/* ── v2 loader ─────────────────────────────────────────────────────── */
-
-/*
- * load_v2 — read v2 pipe-delimited records from V2_PATH.
- * Returns: number of records loaded, or -1 on error.
- */
-static int load_v2(Archive *ar) {
-    FILE *fp = fopen(V2_PATH, "r");
-    if (fp == NULL) return -1;
-
-    char line[4096];
-    int loaded = 0;
-    int max_id = 0;
-
-    /* first line must be the format header */
-    if (fgets(line, sizeof(line), fp) == NULL) {
-        fclose(fp);
-        return -1;
-    }
-
-    /* strip trailing newline for comparison */
-    line[strcspn(line, "\r\n")] = '\0';
-    if (strcmp(line, V2_HEADER) != 0) {
-        fclose(fp);
-        return -1;  /* unrecognised format */
-    }
-
-    /* read records */
-    while (fgets(line, sizeof(line), fp)) {
-        /* skip blank lines */
-        if (line[0] == '\n' || line[0] == '\0') continue;
-
-        Film film;
-        memset(&film, 0, sizeof(film));
-
-        int pos = 0;
-        char id_buf[16], year_buf[16], rating_buf[16];
-        char watched_buf[8];
-
-        /* 10 fields: id|title|director|year|rating|genre|notes|watched|date_watched|journal */
-        if (!parse_field(line, &pos, id_buf,    sizeof(id_buf)))            continue;
-        if (!parse_field(line, &pos, film.title, sizeof(film.title)))       continue;
-        if (!parse_field(line, &pos, film.director, sizeof(film.director))) continue;
-        if (!parse_field(line, &pos, year_buf,   sizeof(year_buf)))         continue;
-        if (!parse_field(line, &pos, rating_buf, sizeof(rating_buf)))       continue;
-        if (!parse_field(line, &pos, film.genre,  sizeof(film.genre)))      continue;
-        if (!parse_field(line, &pos, film.notes,  sizeof(film.notes)))      continue;
-        if (!parse_field(line, &pos, watched_buf, sizeof(watched_buf)))     continue;
-        if (!parse_field(line, &pos, film.date_watched, sizeof(film.date_watched))) continue;
-        /* journal is the last field — may be empty */
-        parse_field(line, &pos, film.journal, sizeof(film.journal));
-
-        film.id      = atoi(id_buf);
-        film.year    = atoi(year_buf);
-        film.rating  = (float)atof(rating_buf);
-        film.watched = atoi(watched_buf);
-
-        /* sanitize all text fields */
-        sanitize_string(film.title);
-        sanitize_string(film.director);
-        sanitize_string(film.genre);
-        sanitize_string(film.notes);
-        sanitize_string(film.date_watched);
-        sanitize_string(film.journal);
-
-        if (film.id <= 0) continue;  /* skip malformed records */
-
-        if (film.id > max_id) max_id = film.id;
-
-        /* allocate and append */
-        Film *new_film = malloc(sizeof(Film));
-        if (new_film == NULL) continue;
-
-        *new_film = film;
-        new_film->next = NULL;
-
-        if (ar->head == NULL) {
-            ar->head = new_film;
-        } else {
-            Film *cur = ar->head;
-            while (cur->next) cur = cur->next;
-            cur->next = new_film;
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(outfd, buf + off, (size_t)(n - off));
+            if (w < 0) {
+                if (errno == EINTR)
+                    continue;
+                ok = false;
+                break;
+            }
+            off += w;
         }
-        ar->count++;
-        loaded++;
+        if (!ok)
+            break;
     }
-
-    fclose(fp);
-
-    ar->next_id  = max_id + 1;
-    ar->modified = 0;  /* freshly loaded — no unsaved changes */
-
-    return loaded;
+    if (ok && full_sync(outfd) != 0)
+        ok = false;
+    if (!ok)
+        snprintf(err, errcap, "copying %s failed: %s", from, strerror(errno));
+    close(in);
+    if (close(outfd) != 0)
+        ok = false;
+    return ok;
 }
 
-/* ── public API ────────────────────────────────────────────────────── */
-
-/*
- * storage_load — populate the archive from persistent storage.
- *
- *   1. Try v2 file (data/films.dat)
- *   2. If absent, try migrating from v1 (data/films.txt)
- *   3. If neither exists, return 0 (first launch — empty archive)
- *
- * Returns: number of records loaded, or -1 on I/O error.
- */
-int storage_load(Archive *ar) {
-    archive_init(ar);
-
-    if (storage_ensure_dir() != 0) return -1;
-
-    /* attempt v2 load */
-    int result = load_v2(ar);
-    if (result >= 0) return result;
-
-    /* v2 not found — try v1 migration */
-    if (access(V1_PATH, F_OK) == 0) {
-        result = load_v1(ar);
-        if (result >= 0) return result;
+/* Keeps the archive being replaced as "<path>.bak". A hard link is instant
+ * and atomic; if the filesystem refuses one we fall back to a copy. */
+static void keep_backup(const char *path)
+{
+    char bak[PATH_MAX];
+    if (snprintf(bak, sizeof bak, "%s.bak", path) >= (int)sizeof bak)
+        return;
+    if (access(path, F_OK) != 0)
+        return;
+    if (unlink(bak) != 0 && errno != ENOENT)
+        return;
+    if (link(path, bak) != 0) {
+        char err[256];
+        (void)storage_copy_file(path, bak, err, sizeof err);
     }
-
-    /* neither file exists: first launch */
-    return 0;
 }
 
-/*
- * storage_save — persist the archive to disk using atomic write.
- *
- * Writes all records to a temporary file (films.dat.tmp), then renames
- * it to films.dat.  This ensures readers never see a partially-written
- * file.
- *
- * Returns: 0 on success, -1 on error.
- */
-int storage_save(Archive *ar) {
-    if (storage_ensure_dir() != 0) return -1;
+bool storage_save(const char *path, const Archive *a, char *err, size_t errcap)
+{
+    if (!ensure_parent_dir(path, err, errcap))
+        return false;
 
-    FILE *fp = fopen(V2_TMP_PATH, "w");
-    if (fp == NULL) return -1;
-
-    /* write format header */
-    fprintf(fp, "%s\n", V2_HEADER);
-
-    /* write each record as a pipe-delimited line */
-    Film *f = ar->head;
-    while (f) {
-        fprintf(fp, "%d|%s|%s|%d|%.1f|%s|%s|%d|%s|%s\n",
-                f->id,
-                f->title,
-                f->director,
-                f->year,
-                f->rating,
-                f->genre,
-                f->notes,
-                f->watched,
-                f->date_watched,
-                f->journal);
-        f = f->next;
+    char tmp[PATH_MAX];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) {
+        snprintf(err, errcap, "path is too long");
+        return false;
     }
 
-    /* flush and check for write errors before renaming */
-    if (fflush(fp) != 0 || ferror(fp)) {
-        fclose(fp);
-        unlink(V2_TMP_PATH);
-        return -1;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        snprintf(err, errcap, "cannot write %s: %s", tmp, strerror(errno));
+        return false;
     }
-    fclose(fp);
-
-    /* atomic rename: tmp → final */
-    if (rename(V2_TMP_PATH, V2_PATH) != 0) {
-        unlink(V2_TMP_PATH);
-        return -1;
+    FILE *fp = fdopen(fd, "w");
+    if (!fp) {
+        snprintf(err, errcap, "cannot write %s: %s", tmp, strerror(errno));
+        close(fd);
+        unlink(tmp);
+        return false;
     }
 
-    ar->modified = 0;
-    return 0;
+    bool ok = true;
+    int saved_errno = 0;
+#define CHECK(expr)                                  \
+    do {                                             \
+        if (ok && !(expr)) {                         \
+            ok = false;                              \
+            saved_errno = errno ? errno : EIO;       \
+        }                                            \
+    } while (0)
+
+    errno = 0;
+    CHECK(fputs("# Cinephilia archive. Plain UTF-8 text; one record per line.\n"
+                "# Format described in README.md. Edit only while Cinephilia is closed.\n",
+                fp) != EOF);
+    CHECK(fprintf(fp, "%s %d\n", MAGIC, STORAGE_FORMAT_VERSION) > 0);
+
+    for (const Film *f = a->head; f && ok; f = f->next) {
+        CHECK(fprintf(fp, "F\t%u\t%c\t%d\t%d\t%s\t%s\t", f->id,
+                      f->status == FILM_WATCHED ? 'w' : 'l', f->year, f->rating,
+                      f->added_on, f->watched_on) > 0);
+        CHECK(write_field(fp, f->title));
+        CHECK(fputc('\t', fp) != EOF);
+        CHECK(write_field(fp, f->director));
+        CHECK(fputc('\t', fp) != EOF);
+        CHECK(write_field(fp, f->genre));
+        CHECK(fputc('\t', fp) != EOF);
+        CHECK(write_field(fp, f->notes));
+        CHECK(fputc('\n', fp) != EOF);
+    }
+    for (size_t i = 0; i < a->journal_count && ok; i++) {
+        const JournalEntry *e = &a->journal[i];
+        CHECK(fprintf(fp, "J\t%u\t%u\t%s\t", e->id, e->film_id, e->date) > 0);
+        CHECK(write_field(fp, e->text));
+        CHECK(fputc('\n', fp) != EOF);
+    }
+    CHECK(fflush(fp) == 0);
+    CHECK(full_sync(fileno(fp)) == 0);
+    if (fclose(fp) != 0 && ok) {
+        ok = false;
+        saved_errno = errno ? errno : EIO;
+    }
+#undef CHECK
+
+    if (!ok) {
+        snprintf(err, errcap, "writing %s failed: %s", tmp, strerror(saved_errno));
+        unlink(tmp);
+        return false;
+    }
+
+    keep_backup(path);
+    if (rename(tmp, path) != 0) {
+        snprintf(err, errcap, "cannot replace %s: %s", path, strerror(errno));
+        unlink(tmp);
+        return false;
+    }
+    sync_parent_dir(path);
+    return true;
 }

@@ -1,29 +1,33 @@
-# Build artifacts
+# Build products
+/cinephilia
+/build/
 *.o
-cinephilia
-cinephile
+*.dSYM/
 
-# Data (user's personal archive)
-data/films.dat
-data/films.txt
-data/*.bak
-data/*.tmp
+# Generated sound effects (recreated by `make`; see tools/gen_sounds.c)
+/assets/audio/*.wav
 
-# IDE and OS
+# Personal data: your archive, its backups and your settings stay private
+/data/*
+!/data/.gitkeep
+*.db
+*.db.bak
+*.db.tmp
+*.db.damaged-*
+settings.conf
+!/examples/sample_archive.db
+
+# Secrets, should a future TMDB integration be added
+.env
+.env.*
+*.key
+
+# Editors and operating systems
 .DS_Store
-*.swp
-*.swo
-*~
 .vscode/
 .idea/
+*.swp
+*~
 
-# Environment
-.env
-
-# Accidental directories
-brew/
-curl/
-install/
-s/
-src/cp/
-src/test/
+# Python caches from the test tools
+__pycache__/

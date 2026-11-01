@@ -1,0 +1,28 @@
+# Cinephilia sample archive: real films; the ratings and notes are illustrative.
+# Copy it before use:  cp examples/sample_archive.db data/cinephilia.db
+CINEPHILIA 1
+F	1	w	2000	10	2025-11-02	2026-09-14	In the Mood for Love	Wong Kar-wai	Romance	The corridor, the rain, the noodle stall. Two people deciding not to become what they suspect.
+F	2	w	1979	10	2025-11-02	2026-03-08	Stalker	Andrei Tarkovsky	Science Fiction	Three men, a room that grants wishes, and the slow realisation that no one dares to want anything.
+F	3	w	1953	9	2025-11-09	2026-01-18	Tokyo Story	Yasujiro Ozu	Drama	Pillow shots and the ache of grown children who are simply busy.
+F	4	w	1975	9	2025-12-01	2026-02-22	Jeanne Dielman, 23 quai du Commerce, 1080 Bruxelles	Chantal Akerman	Drama	Three days, timed to the minute. The potatoes undo everything.
+F	5	w	2001	8	2025-12-01	2026-05-30	Mulholland Drive	David Lynch	Mystery	Silencio.
+F	6	w	1955	9	2026-01-04	2026-06-21	Pather Panchali	Satyajit Ray	Drama	The train across the field of kash flowers.
+F	7	w	1994	9	2026-01-04	2026-08-02	Chungking Express	Wong Kar-wai	Romance	Pineapple tins expiring on the first of May.
+F	8	w	1962	8	2026-02-11	2026-07-11	Cleo from 5 to 7	Agnès Varda	Drama	Ninety minutes in real time, and Paris turns from mirror to window.
+F	9	w	2001	8	2026-02-11	2026-10-04	Spirited Away	Hayao Miyazaki	Animation	The train across the flooded plain, again.
+F	10	l	1975	0	2026-03-15		Mirror	Andrei Tarkovsky	Drama	Everyone says to watch it twice.
+F	11	l	1990	0	2026-04-02		Close-Up	Abbas Kiarostami	Drama	
+F	12	l	1966	0	2026-04-20		Persona	Ingmar Bergman	Drama	Recommended by M. after the Akerman.
+F	13	l	1995	0	2026-06-08		Fallen Angels	Wong Kar-wai	Crime	
+F	14	l	1967	0	2026-07-19		Playtime	Jacques Tati	Comedy	See it on the largest screen available.
+J	1	1	2026-09-14	Third time. Noticed the clocks.
+J	2	2	2026-03-08	Watched alone, late. The dog.
+J	3	3	2026-01-18	
+J	4	4	2026-02-22	Exhausting and exact.
+J	5	5	2026-05-30	
+J	6	6	2026-06-21	Durga in the rain.
+J	7	7	2026-08-02	Faye's apartment. California Dreamin' on repeat.
+J	8	8	2026-07-11	
+J	9	9	2026-10-04	With my niece; she was braver than Chihiro.
+J	10	1	2026-02-14	Valentine's, ironically.
+J	11	2	2025-12-20	

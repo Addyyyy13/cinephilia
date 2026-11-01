@@ -1,425 +1,223 @@
 /*
- * search.c — Search & Filter Engine for CINEPHILIA
- *
- * Provides case-insensitive text search (title, director), exact-match
- * genre filtering, numeric range filters (rating, year), and qsort-based
- * result ordering.  An interactive submenu drives all operations.
+ * search.c — merge sort on the film list, search and filters. See search.h.
  */
-
 #include "search.h"
-#include "ui.h"
-#include <ctype.h>
-#include <string.h>
-#include <stdlib.h>
+
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-/* ────────────────────────────────────────────────────────────────────── */
-/*  Internal helpers                                                     */
-/* ────────────────────────────────────────────────────────────────────── */
+#include "sb.h"
+#include "text.h"
 
-/*
- * strcasestr_match — case-insensitive substring search.
- *
- * Returns 1 if `needle` appears anywhere inside `haystack` (ignoring
- * case), 0 otherwise.  An empty needle always matches.
- */
-static int strcasestr_match(const char *haystack, const char *needle)
+const char *film_sort_title(const char *title)
 {
-    if (!haystack || !needle)
-        return 0;
+    static const char *const articles[] = {"the ", "a ", "an "};
+    for (size_t i = 0; i < sizeof articles / sizeof articles[0]; i++) {
+        size_t n = strlen(articles[i]);
+        if (text_ncasecmp(title, articles[i], n) == 0 && title[n] != '\0')
+            return title + n;
+    }
+    return title;
+}
 
-    if (*needle == '\0')
-        return 1;
+static int cmp_int(int a, int b)
+{
+    return (a > b) - (a < b);
+}
 
-    size_t nlen = strlen(needle);
+/* Total order used by the sort: primary key (possibly reversed), then title,
+ * then id. Missing values are placed last regardless of direction. */
+static int film_compare(const Film *a, const Film *b, SortKey key, bool desc)
+{
+    int c = 0;
+    switch (key) {
+    case SORT_TITLE:
+        c = text_casecmp(film_sort_title(a->title), film_sort_title(b->title));
+        break;
+    case SORT_DIRECTOR: {
+        bool ea = a->director[0] == '\0';
+        bool eb = b->director[0] == '\0';
+        if (ea != eb)
+            return ea ? 1 : -1;
+        c = text_casecmp(a->director, b->director);
+        if (c == 0)
+            c = cmp_int(a->year, b->year);
+        break;
+    }
+    case SORT_YEAR:
+        if ((a->year == 0) != (b->year == 0))
+            return a->year == 0 ? 1 : -1;
+        c = cmp_int(a->year, b->year);
+        break;
+    case SORT_RATING:
+        if ((a->rating == 0) != (b->rating == 0))
+            return a->rating == 0 ? 1 : -1;
+        c = cmp_int(a->rating, b->rating);
+        break;
+    case SORT_ADDED:
+        c = strcmp(a->added_on, b->added_on);
+        if (c == 0) /* same day: the later id was added later */
+            c = (a->id > b->id) - (a->id < b->id);
+        break;
+    }
+    if (desc)
+        c = -c;
+    if (c != 0)
+        return c;
+    c = text_casecmp(film_sort_title(a->title), film_sort_title(b->title));
+    if (c != 0)
+        return c;
+    return (a->id > b->id) - (a->id < b->id);
+}
 
-    for (size_t i = 0; haystack[i] != '\0'; i++) {
-        if (strlen(haystack + i) < nlen)
-            return 0;
-
-        size_t j;
-        for (j = 0; j < nlen; j++) {
-            if (tolower((unsigned char)haystack[i + j]) !=
-                tolower((unsigned char)needle[j]))
-                break;
+/* Merges two sorted singly linked runs (using only `next`). Taking from the
+ * left run on ties keeps the sort stable. */
+static Film *merge(Film *left, Film *right, SortKey key, bool desc)
+{
+    Film head;
+    Film *tail = &head;
+    head.next = NULL;
+    while (left && right) {
+        if (film_compare(left, right, key, desc) <= 0) {
+            tail->next = left;
+            left = left->next;
+        } else {
+            tail->next = right;
+            right = right->next;
         }
-
-        if (j == nlen)
-            return 1;
+        tail = tail->next;
     }
-
-    return 0;
+    tail->next = left ? left : right;
+    return head.next;
 }
 
-/* ────────────────────────────────────────────────────────────────────── */
-/*  SearchResults lifecycle                                              */
-/* ────────────────────────────────────────────────────────────────────── */
-
-/*
- * search_results_init — allocate a SearchResults with initial capacity 16.
- */
-SearchResults search_results_init(void)
+static Film *merge_sort(Film *list, SortKey key, bool desc)
 {
-    SearchResults sr;
-    sr.count    = 0;
-    sr.capacity = 16;
-    sr.films    = malloc(sizeof(Film *) * sr.capacity);
-
-    if (!sr.films) {
-        sr.capacity = 0;
+    if (!list || !list->next)
+        return list;
+    /* Find the middle with the slow/fast pointer technique. */
+    Film *slow = list;
+    Film *fast = list->next;
+    while (fast && fast->next) {
+        slow = slow->next;
+        fast = fast->next->next;
     }
-
-    return sr;
+    Film *second = slow->next;
+    slow->next = NULL;
+    return merge(merge_sort(list, key, desc), merge_sort(second, key, desc), key, desc);
 }
 
-/*
- * search_results_free — release the pointer array.
- *
- * The Film structs themselves belong to the Archive and are NOT freed.
- */
-void search_results_free(SearchResults *sr)
+void archive_sort(Archive *a, SortKey key, bool descending)
 {
-    if (!sr)
-        return;
-
-    free(sr->films);
-    sr->films    = NULL;
-    sr->count    = 0;
-    sr->capacity = 0;
-}
-
-/*
- * search_results_add — append a Film pointer, doubling capacity as needed.
- */
-void search_results_add(SearchResults *sr, Film *f)
-{
-    if (!sr || !f)
-        return;
-
-    if (sr->count >= sr->capacity) {
-        size_t new_cap = (sr->capacity == 0) ? 16 : sr->capacity * 2;
-        Film **tmp = realloc(sr->films, sizeof(Film *) * new_cap);
-
-        if (!tmp) {
-            fprintf(stderr, "  search: memory allocation failed\n");
-            return;
-        }
-
-        sr->films    = tmp;
-        sr->capacity = new_cap;
+    a->head = merge_sort(a->head, key, descending);
+    /* The sort only maintained `next`; rebuild `prev` and `tail`. */
+    Film *prev = NULL;
+    for (Film *f = a->head; f; f = f->next) {
+        f->prev = prev;
+        prev = f;
     }
-
-    sr->films[sr->count++] = f;
+    a->tail = prev;
 }
 
-/* ────────────────────────────────────────────────────────────────────── */
-/*  Search / filter functions                                            */
-/* ────────────────────────────────────────────────────────────────────── */
-
-/*
- * search_by_title — collect every film whose title contains `query`
- *                   (case-insensitive substring match).
- */
-void search_by_title(Archive *ar, const char *query, SearchResults *sr)
+bool sort_default_descending(SortKey key)
 {
-    if (!ar || !query || !sr)
-        return;
+    return key == SORT_RATING || key == SORT_ADDED;
+}
 
-    Film *cur = ar->head;
-
-    while (cur) {
-        if (strcasestr_match(cur->title, query))
-            search_results_add(sr, cur);
-
-        cur = cur->next;
+const char *sort_key_name(SortKey key)
+{
+    switch (key) {
+    case SORT_TITLE: return "title";
+    case SORT_DIRECTOR: return "director";
+    case SORT_YEAR: return "year";
+    case SORT_RATING: return "rating";
+    case SORT_ADDED: return "date added";
     }
+    return "title";
 }
 
-/*
- * search_by_director — collect every film whose director field contains
- *                      `query` (case-insensitive substring match).
- */
-void search_by_director(Archive *ar, const char *query, SearchResults *sr)
+void film_filter_init(FilmFilter *f)
 {
-    if (!ar || !query || !sr)
-        return;
+    memset(f, 0, sizeof *f);
+    f->status = -1;
+}
 
-    Film *cur = ar->head;
+bool film_filter_active(const FilmFilter *f)
+{
+    return f->query[0] || f->genre[0] || f->min_rating > 0 || f->year_from > 0 ||
+           f->year_to > 0 || f->status >= 0;
+}
 
-    while (cur) {
-        if (strcasestr_match(cur->director, query))
-            search_results_add(sr, cur);
+bool film_matches(const Film *film, const FilmFilter *f)
+{
+    if (!f)
+        return true;
+    if (f->query[0] && !text_contains_ci(film->title, f->query) &&
+        !text_contains_ci(film->director, f->query))
+        return false;
+    if (f->genre[0] && text_casecmp(film->genre, f->genre) != 0)
+        return false;
+    if (f->min_rating > 0 && film->rating < f->min_rating)
+        return false;
+    if (f->year_from > 0 && (film->year == 0 || film->year < f->year_from))
+        return false;
+    if (f->year_to > 0 && (film->year == 0 || film->year > f->year_to))
+        return false;
+    if (f->status >= 0 && (int)film->status != f->status)
+        return false;
+    return true;
+}
 
-        cur = cur->next;
+void film_filter_describe(const FilmFilter *f, char *out, size_t cap)
+{
+    Sb sb;
+    sb_init(&sb);
+    const char *sep = "";
+    if (f->query[0]) {
+        sb_printf(&sb, "%s\xE2\x80\x9C%s\xE2\x80\x9D", sep, f->query);
+        sep = " \xC2\xB7 ";
     }
-}
-
-/*
- * search_by_genre — collect every film whose genre matches `genre`
- *                   exactly (case-insensitive).
- */
-void search_by_genre(Archive *ar, const char *genre, SearchResults *sr)
-{
-    if (!ar || !genre || !sr)
-        return;
-
-    Film *cur = ar->head;
-
-    while (cur) {
-        if (strcasecmp(cur->genre, genre) == 0)
-            search_results_add(sr, cur);
-
-        cur = cur->next;
+    if (f->genre[0]) {
+        sb_printf(&sb, "%s%s", sep, f->genre);
+        sep = " \xC2\xB7 ";
     }
-}
-
-/*
- * search_by_min_rating — collect films rated at or above `min_rating`.
- */
-void search_by_min_rating(Archive *ar, float min_rating, SearchResults *sr)
-{
-    if (!ar || !sr)
-        return;
-
-    Film *cur = ar->head;
-
-    while (cur) {
-        if (cur->rating >= min_rating)
-            search_results_add(sr, cur);
-
-        cur = cur->next;
+    if (f->min_rating > 0) {
+        sb_printf(&sb, "%srated %d+", sep, f->min_rating);
+        sep = " \xC2\xB7 ";
     }
+    if (f->year_from > 0 && f->year_to > 0)
+        sb_printf(&sb, "%s%d\xE2\x80\x93%d", sep, f->year_from, f->year_to);
+    else if (f->year_from > 0)
+        sb_printf(&sb, "%sfrom %d", sep, f->year_from);
+    else if (f->year_to > 0)
+        sb_printf(&sb, "%sup to %d", sep, f->year_to);
+    if (f->year_from > 0 || f->year_to > 0)
+        sep = " \xC2\xB7 ";
+    if (f->status >= 0)
+        sb_printf(&sb, "%s%s", sep, f->status == FILM_WATCHED ? "watched" : "watchlist");
+    text_copy(out, cap, sb_str(&sb));
+    sb_free(&sb);
 }
 
-/*
- * search_by_year_range — collect films released within [min_year, max_year].
- */
-void search_by_year_range(Archive *ar, int min_year, int max_year,
-                          SearchResults *sr)
+bool archive_collect(const Archive *a, const FilmFilter *f, const Film ***out, size_t *count)
 {
-    if (!ar || !sr)
-        return;
-
-    Film *cur = ar->head;
-
-    while (cur) {
-        if (cur->year >= min_year && cur->year <= max_year)
-            search_results_add(sr, cur);
-
-        cur = cur->next;
-    }
-}
-
-/* ────────────────────────────────────────────────────────────────────── */
-/*  Sorting comparators (for qsort)                                      */
-/* ────────────────────────────────────────────────────────────────────── */
-
-/* Descending by rating */
-static int cmp_rating_desc(const void *a, const void *b)
-{
-    const Film *fa = *(const Film **)a;
-    const Film *fb = *(const Film **)b;
-
-    if (fb->rating > fa->rating)  return  1;
-    if (fb->rating < fa->rating)  return -1;
-    return 0;
-}
-
-/* Ascending by year */
-static int cmp_year_asc(const void *a, const void *b)
-{
-    const Film *fa = *(const Film **)a;
-    const Film *fb = *(const Film **)b;
-
-    return fa->year - fb->year;
-}
-
-/* Alphabetical ascending, case-insensitive */
-static int cmp_title_asc(const void *a, const void *b)
-{
-    const Film *fa = *(const Film **)a;
-    const Film *fb = *(const Film **)b;
-
-    return strcasecmp(fa->title, fb->title);
-}
-
-/*
- * Public sort wrappers — each delegates to qsort with the right comparator.
- */
-void search_sort_by_rating(SearchResults *sr)
-{
-    if (!sr || sr->count < 2)
-        return;
-    qsort(sr->films, sr->count, sizeof(Film *), cmp_rating_desc);
-}
-
-void search_sort_by_year(SearchResults *sr)
-{
-    if (!sr || sr->count < 2)
-        return;
-    qsort(sr->films, sr->count, sizeof(Film *), cmp_year_asc);
-}
-
-void search_sort_by_title(SearchResults *sr)
-{
-    if (!sr || sr->count < 2)
-        return;
-    qsort(sr->films, sr->count, sizeof(Film *), cmp_title_asc);
-}
-
-/* ────────────────────────────────────────────────────────────────────── */
-/*  Helper: display search results or "not found" message                */
-/* ────────────────────────────────────────────────────────────────────── */
-
-static void display_results(SearchResults *sr)
-{
-    if (sr->count == 0) {
-        printf("\n  %sNo films found.%s\n", MUTED, RESET);
-    } else {
-        printf("\n  %s%zu film(s) found:%s\n", GOLD, sr->count, RESET);
-
-        for (size_t i = 0; i < sr->count; i++)
-            ui_print_film_card(sr->films[i]);
-    }
-}
-
-/* ────────────────────────────────────────────────────────────────────── */
-/*  Interactive search menu                                              */
-/* ────────────────────────────────────────────────────────────────────── */
-
-void search_menu(Archive *ar)
-{
-    int choice;
-
-    do {
-        printf("\n");
-        printf("  %sSearch & Filter%s\n", GOLD, RESET);
-        printf("  %s──────────────────%s\n", MUTED, RESET);
-        printf("  %s1 ─── Search by title%s\n",    BURGUNDY, RESET);
-        printf("  %s2 ─── Search by director%s\n",  BURGUNDY, RESET);
-        printf("  %s3 ─── Filter by genre%s\n",     BURGUNDY, RESET);
-        printf("  %s4 ─── Filter by rating%s\n",    BURGUNDY, RESET);
-        printf("  %s5 ─── Filter by year%s\n",      BURGUNDY, RESET);
-        printf("  %s0 ─── Back%s\n",                MUTED,    RESET);
-        printf("\n  %s> %s", GOLD, RESET);
-
-        if (scanf("%d", &choice) != 1) {
-            printf("\n  Please enter a number.\n");
-            int ch;
-            while ((ch = getchar()) != '\n' && ch != EOF) {}
-            continue;
-        }
-
-        /* Flush the trailing newline so fgets-style reads work later */
-        while (getchar() != '\n') {}
-
-        char query[256];
-        SearchResults sr;
-
-        switch (choice) {
-        /* ── Search by title ─────────────────────────────────────── */
-        case 1:
-            printf("\n  %sEnter title to search: %s", CREAM, RESET);
-            if (fgets(query, sizeof(query), stdin) == NULL)
-                break;
-            query[strcspn(query, "\n")] = '\0';
-
-            sr = search_results_init();
-            search_by_title(ar, query, &sr);
-            search_sort_by_title(&sr);
-            display_results(&sr);
-            ui_press_enter();
-            search_results_free(&sr);
-            break;
-
-        /* ── Search by director ──────────────────────────────────── */
-        case 2:
-            printf("\n  %sEnter director to search: %s", CREAM, RESET);
-            if (fgets(query, sizeof(query), stdin) == NULL)
-                break;
-            query[strcspn(query, "\n")] = '\0';
-
-            sr = search_results_init();
-            search_by_director(ar, query, &sr);
-            search_sort_by_title(&sr);
-            display_results(&sr);
-            ui_press_enter();
-            search_results_free(&sr);
-            break;
-
-        /* ── Filter by genre ─────────────────────────────────────── */
-        case 3:
-            printf("\n  %sEnter genre: %s", CREAM, RESET);
-            if (fgets(query, sizeof(query), stdin) == NULL)
-                break;
-            query[strcspn(query, "\n")] = '\0';
-
-            sr = search_results_init();
-            search_by_genre(ar, query, &sr);
-            search_sort_by_rating(&sr);
-            display_results(&sr);
-            ui_press_enter();
-            search_results_free(&sr);
-            break;
-
-        /* ── Filter by minimum rating ────────────────────────────── */
-        case 4: {
-            float min_rating;
-            printf("\n  %sMinimum rating (0-10): %s", CREAM, RESET);
-
-            if (scanf("%f", &min_rating) != 1) {
-                printf("\n  Invalid rating.\n");
-                while (getchar() != '\n') {}
-                break;
-            }
-            while (getchar() != '\n') {}
-
-            sr = search_results_init();
-            search_by_min_rating(ar, min_rating, &sr);
-            search_sort_by_rating(&sr);
-            display_results(&sr);
-            ui_press_enter();
-            search_results_free(&sr);
-            break;
-        }
-
-        /* ── Filter by year range ────────────────────────────────── */
-        case 5: {
-            int min_year, max_year;
-            printf("\n  %sStart year: %s", CREAM, RESET);
-
-            if (scanf("%d", &min_year) != 1) {
-                printf("\n  Invalid year.\n");
-                while (getchar() != '\n') {}
-                break;
-            }
-            while (getchar() != '\n') {}
-
-            printf("  %sEnd year:   %s", CREAM, RESET);
-
-            if (scanf("%d", &max_year) != 1) {
-                printf("\n  Invalid year.\n");
-                while (getchar() != '\n') {}
-                break;
-            }
-            while (getchar() != '\n') {}
-
-            sr = search_results_init();
-            search_by_year_range(ar, min_year, max_year, &sr);
-            search_sort_by_year(&sr);
-            display_results(&sr);
-            ui_press_enter();
-            search_results_free(&sr);
-            break;
-        }
-
-        case 0:
-            break;
-
-        default:
-            printf("\n  %sPlease choose a valid option.%s\n", MUTED, RESET);
-            break;
-        }
-
-    } while (choice != 0);
+    *out = NULL;
+    *count = 0;
+    size_t n = 0;
+    for (const Film *x = a->head; x; x = x->next)
+        if (film_matches(x, f))
+            n++;
+    if (n == 0)
+        return true;
+    const Film **arr = malloc(n * sizeof *arr);
+    if (!arr)
+        return false;
+    size_t i = 0;
+    for (const Film *x = a->head; x; x = x->next)
+        if (film_matches(x, f))
+            arr[i++] = x;
+    *out = arr;
+    *count = n;
+    return true;
 }
