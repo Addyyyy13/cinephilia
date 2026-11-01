@@ -21,6 +21,7 @@
 #include "dsa/stack.h"
 #include "dsa/tally.h"
 #include "film.h"
+#include "json.h"
 #include "search.h"
 #include "settings.h"
 #include "stats.h"
@@ -748,13 +749,77 @@ static void test_audio(void)
     unsetenv("CINEPHILIA_AUDIO_DIR");
 }
 
+static void test_json(void)
+{
+    group("json: values, escapes, nesting, errors");
+    JsonNode *j = json_parse(" {\"a\": [1, 2.5, -3e2], \"s\": \"caf\\u00e9 \\\"q\\\" \\ud83c\\udfac\\n\","
+                             " \"t\": true, \"f\": false, \"n\": null, \"o\": {\"x\": {}}} ");
+    CHECK(j && j->type == JSON_OBJECT && json_count(j) == 6);
+    const JsonNode *a = json_get(j, "a");
+    CHECK(json_count(a) == 3 && json_at(a, 1)->number == 2.5 && json_at(a, 2)->number == -300);
+    CHECK(json_at(a, 3) == NULL);
+    CHECK_STR(json_text(json_get(j, "s"), "?"), "caf\xC3\xA9 \"q\" \xF0\x9F\x8E\xAC\n");
+    CHECK(json_get(j, "t")->boolean && !json_get(j, "f")->boolean);
+    CHECK(json_get(j, "n")->type == JSON_NULL);
+    CHECK(json_get(json_get(j, "o"), "x")->type == JSON_OBJECT);
+    CHECK(json_get(j, "missing") == NULL && json_get(NULL, "a") == NULL);
+    CHECK_STR(json_text(json_get(j, "t"), "fallback"), "fallback");
+    json_free(j);
+
+    const char *bad[] = {"", "{", "[1,]", "{\"a\" 1}", "{\"a\":1,}", "tru", "\"unterminated",
+                         "[1] x", "\"bad \\q escape\"", "\"\\ud800 lone\"", "\"raw\ttab\"", "01x"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        JsonNode *b = json_parse(bad[i]);
+        CHECK(b == NULL);
+        json_free(b);
+    }
+    char deep[300];
+    memset(deep, '[', 200);
+    memset(deep + 200, ']', 99);
+    deep[299] = '\0';
+    CHECK(json_parse(deep) == NULL); /* too deep: refused, not a crash */
+}
+
 static void test_tmdb(void)
 {
-    group("tmdb: the placeholder never pretends");
-    TmdbFilm film;
+    group("tmdb: reading search and detail replies");
+    long id = 0;
+    CHECK(tmdb_parse_search("{\"page\":1,\"results\":[{\"id\":843,\"title\":\"In the Mood for Love\"},"
+                            "{\"id\":1,\"title\":\"Other\"}],\"total_results\":2}", &id) == TMDB_OK);
+    CHECK(id == 843);
+    CHECK(tmdb_parse_search("{\"page\":1,\"results\":[],\"total_results\":0}", &id) == TMDB_NOT_FOUND);
+    CHECK(tmdb_parse_search("{\"status_message\":\"Invalid API key\"}", &id) == TMDB_BAD_RESPONSE);
+    CHECK(tmdb_parse_search("<html>Gateway timeout</html>", &id) == TMDB_BAD_RESPONSE);
+
+    TmdbFilm f;
+    CHECK(tmdb_parse_details(
+              "{\"id\":843,\"title\":\"In the Mood for Love\",\"release_date\":\"2000-09-29\","
+              "\"overview\":\"Hong Kong, 1962.\\nTwo neighbours\\u2026\","
+              "\"genres\":[{\"id\":18,\"name\":\"Drama\"},{\"id\":10749,\"name\":\"Romance\"}],"
+              "\"credits\":{\"cast\":[],\"crew\":[{\"job\":\"Producer\",\"name\":\"Someone\"},"
+              "{\"job\":\"Director\",\"name\":\"Wong Kar-wai\"}]}}",
+              &f) == TMDB_OK);
+    CHECK_STR(f.title, "In the Mood for Love");
+    CHECK(f.year == 2000);
+    CHECK_STR(f.genre, "Drama");
+    CHECK_STR(f.director, "Wong Kar-wai");
+    CHECK(strchr(f.synopsis, '\n') == NULL); /* control characters removed */
+    CHECK(strstr(f.synopsis, "Two neighbours\xE2\x80\xA6") != NULL);
+
+    CHECK(tmdb_parse_details("{\"title\":\"Unreleased\",\"release_date\":\"\",\"genres\":[]}", &f) == TMDB_OK);
+    CHECK(f.year == 0 && f.genre[0] == '\0' && f.director[0] == '\0');
+    CHECK(tmdb_parse_details("{\"title\":\"Evil\\u001b[31m\"}", &f) == TMDB_OK);
+    CHECK(strchr(f.title, '\033') == NULL); /* no terminal escapes from the network */
+    CHECK(tmdb_parse_details("{\"id\":1}", &f) == TMDB_BAD_RESPONSE);
+    CHECK(tmdb_parse_details("[]", &f) == TMDB_BAD_RESPONSE);
+
+    group("tmdb: without a key nothing is requested");
+    unsetenv("TMDB_API_KEY");
     CHECK(!tmdb_available());
-    CHECK(tmdb_lookup("Stalker", 1979, &film) == TMDB_UNAVAILABLE);
-    CHECK(film.title[0] == '\0' && film.year == 0);
+    CHECK(tmdb_lookup("Stalker", 0, &f) == TMDB_NO_KEY || tmdb_lookup("Stalker", 0, &f) == TMDB_UNAVAILABLE);
+    setenv("TMDB_API_KEY", "abc\"; url = \"http://evil", 1); /* not a key: refused */
+    CHECK(!tmdb_available());
+    unsetenv("TMDB_API_KEY");
 }
 
 int main(void)
@@ -774,6 +839,7 @@ int main(void)
     test_stats();
     test_settings();
     test_audio();
+    test_json();
     test_tmdb();
 
     char cmd[600];

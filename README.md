@@ -322,7 +322,8 @@ src/discover.c    random picks, recommendations, double features (seedable RNG)
 src/stats.c       statistics
 src/settings.c    preferences file
 src/audio.c       non-blocking, process-controlled playback
-src/tmdb.c        placeholder for a future TMDB lookup (see below)
+src/tmdb.c        optional TMDB lookups through /usr/bin/curl
+src/json.c        a small recursive-descent JSON parser (for TMDB replies)
 src/text.c        UTF-8 width, truncation, wrapping, sanitising, dates
 src/sb.c          string builder and string list
 src/dsa/stack.c   LIFO stack (undo)
@@ -362,15 +363,15 @@ make test       # unit tests, end-to-end tests, sound checks
 make sanitize   # the same under AddressSanitizer and UndefinedBehaviorSanitizer
 ```
 
-- **Unit tests** (`tests/test_core.c`, 1,327 checks): UTF-8 width and
+- **Unit tests** (`tests/test_core.c`, 1,367 checks): UTF-8 width and
   truncation, sanitising of escape sequences, dates and leap years, the
   wordmark decoding to CINEPHILIA, linked-list integrity after sorts and
   deletes, sort order and stability over 600 random films, filters, storage
   round trips with tabs, backslashes and CJK text, malformed and truncated
   files, foreign and newer files, write failures that must leave the old
   archive intact, uniformity of random picks, recommendation ranking, double
-  features, statistics on empty and populated archives, settings, the TMDB
-  placeholder, and audio process control (missing player, missing files,
+  features, statistics on empty and populated archives, settings, the JSON
+  parser and TMDB reply handling, and audio process control (missing player, missing files,
   throttling, the four-player cap, paths with spaces, cleanup with no
   zombies).
 - **End-to-end tests** (`tests/e2e.sh`, 96 checks) drive the real binary
@@ -389,16 +390,31 @@ make sanitize   # the same under AddressSanitizer and UndefinedBehaviorSanitizer
 
 ## TMDB
 
-[The Movie Database](https://www.themoviedb.org/) metadata (synopsis, year,
-genre) is **not** included in this version, and Cinephilia never needs an
-account, a key or a network connection. `include/tmdb.h` defines the planned
-interface; `src/tmdb.c` is an honest placeholder that performs no network
-access and always reports *unavailable*, so the interface does not offer the
-feature. A future implementation should read the key only from the
-`TMDB_API_KEY` environment variable, use the system libcurl, handle errors,
-missing results and rate limits explicitly, and display TMDB's required
-notice: *This product uses the TMDB API but is not endorsed or certified by
-TMDB.* TMDB's API terms limit free use to non-commercial projects.
+Cinephilia can fill in a film's director, release year and genre from
+[The Movie Database](https://www.themoviedb.org/). It is optional: without
+a key the feature is simply not offered, and everything else works offline.
+
+1. Create a free TMDB account, then request an API key under
+   **Settings → API** (choose *Developer*).
+2. Make the key available to Cinephilia, for example in `~/.zshrc`:
+   ```sh
+   export TMDB_API_KEY="your-32-character-key"
+   ```
+3. Open a new Terminal window and add a film. After you type the title,
+   Cinephilia asks *Look this film up on TMDB?*, shows what it found, and
+   asks before using it.
+
+How it works: requests are made by macOS's own `/usr/bin/curl`, so there is
+nothing extra to install. The key is handed to curl on its standard input,
+never on the command line where other users could see it, and it is never
+written to the archive or the repository. Replies are read by a small JSON
+parser (`src/json.c`); text from TMDB is cleaned of control characters
+before it is shown or stored. A missing connection, an unknown title, a
+rejected key and TMDB's rate limit each produce a clear message, and you can
+always type the details yourself.
+
+*This product uses the TMDB API but is not endorsed or certified by TMDB.*
+TMDB's API terms allow free use for non-commercial projects.
 
 ## Known limitations
 

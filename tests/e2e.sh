@@ -19,7 +19,7 @@ DB="$WORK/archive.db"
 export CINEPHILIA_TODAY=2026-10-22
 export CINEPHILIA_SEED=42
 export LANG=C LC_ALL=C
-unset CINEPHILIA_DATA NO_COLOR
+unset CINEPHILIA_DATA NO_COLOR TMDB_API_KEY TMDB_BASE_URL
 
 ok() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [ -n "${2:-}" ] && printf '        %s\n' "$2"; }

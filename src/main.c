@@ -24,6 +24,7 @@
 #include "stats.h"
 #include "storage.h"
 #include "text.h"
+#include "tmdb.h"
 #include "ui.h"
 
 #define APP_VERSION "1.0.0"
@@ -490,6 +491,43 @@ cancelled:
     ui_flash(UI_TONE_INFO, "Nothing was logged.");
 }
 
+/* Offers to fill in director, year and genre from TMDB after the title
+ * has been typed. Returns true if the user accepted TMDB's details, which
+ * are then copied into `draft`. Only offered when TMDB_API_KEY is set. */
+static bool offer_tmdb(Film *draft)
+{
+    if (!tmdb_available())
+        return false;
+    if (!ui_confirm("Look this film up on TMDB?", true))
+        return false;
+    ui_say(UI_TONE_INFO, "Asking TMDB\xE2\x80\xA6");
+    TmdbFilm found;
+    TmdbResult r = tmdb_lookup(draft->title, 0, &found);
+    if (r != TMDB_OK) {
+        ui_say(UI_TONE_WARN, "%s You can enter the details yourself.", tmdb_result_text(r));
+        return false;
+    }
+    char year[8];
+    fmt_year(found.year, year, sizeof year);
+    ui_say(UI_TONE_OK, "%s (%s)%s%s", found.title, year, found.director[0] ? ", directed by " : "",
+           found.director);
+    if (found.genre[0])
+        ui_say(UI_TONE_INFO, "Genre: %s", found.genre);
+    if (found.synopsis[0]) {
+        char shortened[400];
+        text_fit(shortened, sizeof shortened, found.synopsis, 220);
+        ui_say(UI_TONE_INFO, "%s", shortened);
+    }
+    ui_say(UI_TONE_INFO, "%s", TMDB_NOTICE);
+    if (!ui_confirm("Use these details?", true))
+        return false;
+    text_copy(draft->title, sizeof draft->title, found.title);
+    text_copy(draft->director, sizeof draft->director, found.director);
+    text_copy(draft->genre, sizeof draft->genre, found.genre);
+    draft->year = found.year;
+    return true;
+}
+
 /* preset: -1 to ask, or FILM_WATCHED / FILM_WATCHLIST. prefill: an initial
  * title (from a search), or NULL. Returns the new id, or 0. */
 static unsigned flow_add_film(App *app, int preset, const char *prefill)
@@ -515,18 +553,23 @@ static unsigned flow_add_film(App *app, int preset, const char *prefill)
     }
     if (r != PROMPT_OK)
         goto cancelled;
-    r = ui_prompt("Director", "optional", NULL, draft.director, sizeof draft.director);
-    if (r == PROMPT_CANCEL)
+    bool from_tmdb = offer_tmdb(&draft);
+    if (ui_input_closed())
         goto cancelled;
-    if (strcmp(draft.director, "-") == 0)
-        draft.director[0] = '\0';
+    if (!from_tmdb) {
+        r = ui_prompt("Director", "optional", NULL, draft.director, sizeof draft.director);
+        if (r == PROMPT_CANCEL)
+            goto cancelled;
+        if (strcmp(draft.director, "-") == 0)
+            draft.director[0] = '\0';
 
-    snprintf(hint, sizeof hint, "%d-%d " MIDDOT " blank if unknown", FILM_YEAR_MIN, app->this_year + 10);
-    int year = 0;
-    r = ui_prompt_int("Release year", hint, NULL, FILM_YEAR_MIN, app->this_year + 10, &year);
-    if (r == PROMPT_CANCEL)
-        goto cancelled;
-    draft.year = r == PROMPT_OK ? year : 0;
+        snprintf(hint, sizeof hint, "%d-%d " MIDDOT " blank if unknown", FILM_YEAR_MIN, app->this_year + 10);
+        int year = 0;
+        r = ui_prompt_int("Release year", hint, NULL, FILM_YEAR_MIN, app->this_year + 10, &year);
+        if (r == PROMPT_CANCEL)
+            goto cancelled;
+        draft.year = r == PROMPT_OK ? year : 0;
+    }
 
     const Film *dup = archive_find_duplicate(&app->archive, draft.title, draft.year, NULL);
     if (dup) {
@@ -537,12 +580,14 @@ static unsigned flow_add_film(App *app, int preset, const char *prefill)
             goto cancelled;
     }
 
-    genre_hint(app, hint, sizeof hint);
-    r = ui_prompt("Genre", hint, NULL, draft.genre, sizeof draft.genre);
-    if (r == PROMPT_CANCEL)
-        goto cancelled;
-    if (strcmp(draft.genre, "-") == 0)
-        draft.genre[0] = '\0';
+    if (!from_tmdb) {
+        genre_hint(app, hint, sizeof hint);
+        r = ui_prompt("Genre", hint, NULL, draft.genre, sizeof draft.genre);
+        if (r == PROMPT_CANCEL)
+            goto cancelled;
+        if (strcmp(draft.genre, "-") == 0)
+            draft.genre[0] = '\0';
+    }
     normalize_genre(app, draft.genre);
 
     bool watched;
